@@ -12,15 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import asyncio
 import logging
 import os
-import threading
 from contextlib import ExitStack
 from enum import Enum
 from typing import Any, Callable, Optional, TypeVar
 from uuid import uuid4
 
 import ray
+from ray.exceptions import ActorDiedError
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy, PlacementGroupSchedulingStrategy
 
 from verl.tools.base_tool import BaseTool
 from verl.utils.reward_score.sandbox_fusion.utils import _process_single_case
@@ -39,21 +41,19 @@ class PoolMode(Enum):
     ProcessMode = 2
 
 
-@ray.remote(concurrency_groups={"acquire": 1, "release": 10})
+@ray.remote
 class TokenBucketWorker:
     def __init__(self, rate_limit: int):
         self.rate_limit = rate_limit
         # this only used for observalability
         self.current_count = 0
-        self._semaphore = threading.Semaphore(rate_limit)
+        self._semaphore = asyncio.Semaphore(rate_limit)
 
-    @ray.method(concurrency_group="acquire")
-    def acquire(self):
-        self._semaphore.acquire()
+    async def acquire(self):
+        await self._semaphore.acquire()
         self.current_count += 1
 
-    @ray.method(concurrency_group="release")
-    def release(self):
+    async def release(self):
         self._semaphore.release()
         self.current_count -= 1
 
@@ -61,22 +61,52 @@ class TokenBucketWorker:
         return self.current_count
 
 
-class ExecutionWorker:
-    def __init__(self, enable_global_rate_limit=True, rate_limit=10):
-        self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+@ray.remote
+class RateLimiterManager:
+    def __init__(self, rate_limit: int, rate_limiter_options: dict[str, Any]):
+        self.rate_limit = rate_limit
+        self.rate_limiter_options = rate_limiter_options
+        self.rate_limiter_name = rate_limiter_options["name"]
 
-    def _init_rate_limit(self, rate_limit):
-        # TODO validation for rate_limit
-        # A Singleton Rate Limitor
-        return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+    def get_rate_limiter(self):
+        try:
+            return ray.get_actor(self.rate_limiter_name)
+        except (ValueError, ActorDiedError):
+            return TokenBucketWorker.options(**self.rate_limiter_options).remote(self.rate_limit)
+
+
+def _build_scheduling_strategy(placement_group=None, node_affinity=None):
+    if placement_group is not None:
+        return PlacementGroupSchedulingStrategy(
+            placement_group=placement_group,
+            placement_group_bundle_index=0,
+            placement_group_capture_child_tasks=True,
+        )
+    if node_affinity is not None:
+        return NodeAffinitySchedulingStrategy(node_id=node_affinity, soft=False)
+    return None
+
+
+class ExecutionWorker:
+    def __init__(self, enable_global_rate_limit=True, rate_limit_manager=None):
+        self.rate_limit_manager = rate_limit_manager if enable_global_rate_limit else None
+        self.rate_limit_worker = self._init_rate_limit() if self.rate_limit_manager else None
+
+    def _init_rate_limit(self):
+        return ray.get(self.rate_limit_manager.get_rate_limiter.remote())
 
     def ping(self):
         return True
 
     def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
         with ExitStack() as stack:
-            stack.callback(self.rate_limit_worker.release.remote)
-            ray.get(self.rate_limit_worker.acquire.remote())
+            if self.rate_limit_worker is not None:
+                try:
+                    ray.get(self.rate_limit_worker.acquire.remote())
+                except ActorDiedError:
+                    self.rate_limit_worker = ray.get(self.rate_limit_manager.get_rate_limiter.remote())
+                    ray.get(self.rate_limit_worker.acquire.remote())
+                stack.callback(self.rate_limit_worker.release.remote)
             try:
                 return fn(*fn_args, **fn_kwargs)
             except Exception as e:
@@ -85,13 +115,42 @@ class ExecutionWorker:
 
 
 def init_execution_pool(
-    num_workers: int, enable_global_rate_limit=True, rate_limit=10, mode: PoolMode = PoolMode.ThreadMode
+    num_workers: int,
+    enable_global_rate_limit=True,
+    rate_limit=10,
+    mode: PoolMode = PoolMode.ThreadMode,
+    placement_group=None,
+    node_affinity=None,
 ):
     if mode == PoolMode.ThreadMode:
+        scheduling_strategy = _build_scheduling_strategy(placement_group=placement_group, node_affinity=node_affinity)
+        rate_limiter_max_concurrency = max(rate_limit * 2, 32)
+        rate_limiter_manager = None
+        if enable_global_rate_limit:
+            manager_options = {
+                "name": "rate-limiter-manager",
+                "lifetime": "detached",
+                "get_if_exists": True,
+            }
+            if scheduling_strategy is not None:
+                manager_options["scheduling_strategy"] = scheduling_strategy
+                rate_limiter_scheduling = scheduling_strategy
+            else:
+                rate_limiter_scheduling = None
+            rate_limiter_manager = RateLimiterManager.options(**manager_options).remote(
+                rate_limit=rate_limit,
+                rate_limiter_options={
+                    "name": "rate-limiter",
+                    "lifetime": "detached",
+                    "max_concurrency": rate_limiter_max_concurrency,
+                    **({"scheduling_strategy": rate_limiter_scheduling} if rate_limiter_scheduling else {}),
+                },
+            )
+            ray.get(rate_limiter_manager.get_rate_limiter.remote())
         return (
             ray.remote(ExecutionWorker)
-            .options(max_concurrency=num_workers)
-            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit=rate_limit)
+            .options(max_concurrency=num_workers, scheduling_strategy=scheduling_strategy)
+            .remote(enable_global_rate_limit=enable_global_rate_limit, rate_limit_manager=rate_limiter_manager)
         )
     else:
         raise NotImplementedError("Process mode is not implemented yet")
@@ -136,11 +195,15 @@ class SandboxFusionTool(BaseTool):
         self.default_timeout = config.get("default_timeout", 30)
         self.default_language = config.get("default_language", "python")
         self.enable_global_rate_limit = config.get("enable_global_rate_limit", True)
+        self.placement_group = config.get("placement_group")
+        self.node_affinity = config.get("node_affinity")
         self.execution_pool = init_execution_pool(
             num_workers=self.num_workers,
             enable_global_rate_limit=self.enable_global_rate_limit,
             rate_limit=self.rate_limit,
             mode=PoolMode.ThreadMode,
+            placement_group=self.placement_group,
+            node_affinity=self.node_affinity,
         )
         self.sandbox_fusion_url = config.get("sandbox_fusion_url", "")
         self.memory_limit_mb = config.get("memory_limit_mb", 1024)

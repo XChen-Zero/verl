@@ -29,7 +29,7 @@ Non-Goals
 
 - Training effectiveness is out of scope.
 - Observability metrics are not considered.
-- Distributed failover and component fault tolerance are not addressed.
+- End-to-end fault tolerance beyond the rate limiter lifecycle is not addressed.
 
 Design Details
 ==============
@@ -80,6 +80,10 @@ Configuration Parameters
 +----------------------------+--------------------------------------------------------------+
 | `sandbox_fusion_url`       | URL for the veFaas sandbox execution service                 |
 +----------------------------+--------------------------------------------------------------+
+| `placement_group`          | Optional Ray placement group for execution + rate limiter    |
++----------------------------+--------------------------------------------------------------+
+| `node_affinity`            | Optional Ray node ID for execution + rate limiter scheduling |
++----------------------------+--------------------------------------------------------------+
 
 Rate Limiting Design
 -----------------------
@@ -92,45 +96,63 @@ Objective:
 
 Design Highlights:
 
-- Use Ray Global Actor as a singleton distributed counter at cluster level.
-  
-- Semaphore used for counting, with `acquire` and `release` in separate thread pools to preserve order.
-  
-- Use Ray’s cloud-pickle to serialize functions for decoupled `ExecutionWorker`.
+- Use a detached Ray actor for the rate limiter, managed by a dedicated manager actor.
+
+- The manager detects a missing/dead actor via `ray.get_actor` exceptions and recreates it.
+
+- Async semaphore plus Ray `max_concurrency` allow higher concurrency without blocking.
+
+- Placement group / node affinity can pin the rate limiter and workers to stable nodes.
 
 .. code-block:: python
 
-   @ray.remote(concurrency_groups={"acquire": 1,"release": 10})
+   @ray.remote
    class TokenBucketWorker:
        def __init__(self, rate_limit: int):
            self.rate_limit = rate_limit
            self.current_count = 0
-           self._semaphore = threading.Semaphore(rate_limit)
+           self._semaphore = asyncio.Semaphore(rate_limit)
 
-       @ray.method(concurrency_group="acquire")
-       def acquire(self):
-           self._semaphore.acquire()
+       async def acquire(self):
+           await self._semaphore.acquire()
            self.current_count += 1
 
-       @ray.method(concurrency_group="release")
-       def release(self):
+       async def release(self):
            self._semaphore.release()
            self.current_count -= 1
 
        def get_current_count(self):
            return self.current_count
 
-   class ExecutionWorker:
-       def __init__(self, enable_global_rate_limit=True, rate_limit=10):
-           self.rate_limit_worker = self._init_rate_limit(rate_limit) if enable_global_rate_limit else None
+   @ray.remote
+   class RateLimiterManager:
+       def __init__(self, rate_limit: int, rate_limiter_options: dict[str, Any]):
+           self.rate_limit = rate_limit
+           self.rate_limiter_options = rate_limiter_options
+           self.rate_limiter_name = rate_limiter_options["name"]
 
-       def _init_rate_limit(self, rate_limit):
-           return TokenBucketWorker.options(name="rate-limiter", get_if_exists=True).remote(rate_limit)
+       def get_rate_limiter(self):
+           try:
+               return ray.get_actor(self.rate_limiter_name)
+           except (ValueError, ActorDiedError):
+               return TokenBucketWorker.options(**self.rate_limiter_options).remote(self.rate_limit)
+
+   class ExecutionWorker:
+       def __init__(self, enable_global_rate_limit=True, rate_limit_manager=None):
+           self.rate_limit_manager = rate_limit_manager if enable_global_rate_limit else None
+           self.rate_limit_worker = self._init_rate_limit() if self.rate_limit_manager else None
+
+       def _init_rate_limit(self):
+           return ray.get(self.rate_limit_manager.get_rate_limiter.remote())
 
        def execute(self, fn: Callable[..., T], *fn_args, **fn_kwargs) -> T:
            with ExitStack() as stack:
+               try:
+                   ray.get(self.rate_limit_worker.acquire.remote())
+               except ActorDiedError:
+                   self.rate_limit_worker = ray.get(self.rate_limit_manager.get_rate_limiter.remote())
+                   ray.get(self.rate_limit_worker.acquire.remote())
                stack.callback(self.rate_limit_worker.release.remote)
-               ray.get(self.rate_limit_worker.acquire.remote())
                try:
                    return fn(*fn_args, **fn_kwargs)
                except Exception as e:
@@ -138,9 +160,22 @@ Design Highlights:
 
    def init_execution_pool(num_workers: int, enable_global_rate_limit=True, rate_limit=10, mode: PoolMode=PoolMode.ThreadMode):
        if mode == PoolMode.ThreadMode:
+           rate_limiter_manager = RateLimiterManager.options(
+               name="rate-limiter-manager",
+               lifetime="detached",
+               get_if_exists=True,
+           ).remote(
+               rate_limit=rate_limit,
+               rate_limiter_options={
+                   "name": "rate-limiter",
+                   "lifetime": "detached",
+                   "max_concurrency": 32,
+               },
+           )
+           ray.get(rate_limiter_manager.get_rate_limiter.remote())
            return ray.remote(ExecutionWorker).options(max_concurrency=num_workers).remote(
                enable_global_rate_limit=enable_global_rate_limit,
-               rate_limit=rate_limit
+               rate_limit_manager=rate_limiter_manager,
            )
        else:
            raise NotImplementedError("Process mode is not implemented yet")
